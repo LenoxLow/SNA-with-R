@@ -1,0 +1,208 @@
+---
+title: "Predicting Churn using Social Network Analysis with R"
+author: "Lenox Low"
+date: "September 28, 2018"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This tutorial used the sample data to demonstrate the basic processes of performing social network analysis with R. The `igraph` library was used to do the social network analysis. You should install the latest version of `igraph` for R.
+```{r eval=TRUE, echo=FALSE}
+```
+
+##(A) Import Libraries
+```{r eval=TRUE, echo=TRUE, message= FALSE}
+library("igraph")
+library("data.table")
+```
+
+
+##(B) Import Data
+```{r eval=TRUE, echo = TRUE}
+transaction <- read.csv("../Data/transaction_sample.csv", header=TRUE);
+head(transaction)
+```
+
+
+##(C) Data Preprocessing
+Extract the unique MSISDN from the transaction data, then calculate the total incoming and outgoing call count and duration for each MSISDN. Two functions were created to extract the MSISDNs.
+
+###(I) Extract unique MSISDN from the transaction data
+```{r eval=TRUE, echo=TRUE}
+
+ExtractUniqueMSISDNList <- function(target.df) {
+  temp1 <- unique(target.df$PARTY_A)
+  temp2 <- unique(target.df$PARTY_B)
+  temp <- c(temp1, temp2)
+  
+  m.list <- unique(temp)
+  m.list <- data.frame(m.list)
+  colnames(m.list)[1] <- "MSISDN"
+  
+  return(m.list)
+}
+subs <- ExtractUniqueMSISDNList(transaction)
+```
+
+###(II) Extract the transaction reecords of defined MSISDN.
+```{r eval=TRUE, echo=TRUE}
+ExtractTransactionByMSISDN <- function(msisdn, target.df){
+  sub.trans <- target.df[target.df$PARTY_A == msisdn | target.df$PARTY_B == msisdn, ]
+  
+  return(sub.trans)
+}
+```
+
+Calculate the total call count and duration
+```{r eval=TRUE, echo=TRUE}
+
+
+for(i in 1:nrow(subs)){
+  subs$CALL_IN_DUR[i] <- sum(transaction$CALL_DURATION[transaction$PARTY_B == subs$MSISDN[i]]) 
+  subs$CALL_OUT_DUR[i] <- sum(transaction$CALL_DURATION[transaction$PARTY_A == subs$MSISDN[i]]) 
+  
+  subs$CALL_IN_COUNT[i] <- sum(transaction$CALL_COUNT[transaction$PARTY_B == subs$MSISDN[i]]) 
+  subs$CALL_OUT_COUNT[i] <- sum(transaction$CALL_COUNT[transaction$PARTY_A == subs$MSISDN[i]]) 
+  
+  subs$RELATION_COUNT[i] <- nrow(ExtractUniqueMSISDNList(ExtractTransactionByMSISDN(subs$MSISDN[i], transaction))) - 1 
+  subs$IN_RELATION[i] <- nrow(transaction[transaction$PARTY_B == subs$MSISDN[i], ])
+  subs$OUT_RELATION[i] <- nrow(transaction[transaction$PARTY_A == subs$MSISDN[i], ])
+}
+
+subs$TOTAL_CALL_COUNT <- subs$CALL_IN_COUNT + subs$CALL_OUT_COUNT
+
+head(subs)
+```
+
+###(I) Data Cleansing
+Set the boundary value for the cleansing criteria
+```{r eval=TRUE, echo=TRUE}
+call.relation <- 30
+call.count <- 30
+call.mean <- mean(subs$TOTAL_CALL_COUNT)
+call.duration <- 15
+```
+
+Label every MSIDSN based on the criteria stated below.
+CALL CENTER - Incoming call is greater than call count boundary
+              No outgoing call
+              Call relation count is greater than call relation count boundary
+TELESALES -   Outgoing call is greater than call count boundary
+              No incoming call
+              Outgoing call divided by call relation count is less than the mean of the total call count
+NOISY -       Incoming call count is 1
+              No outgoing call
+              The call duration is less than the call duration boundary
+```{r eval=TRUE, echo=TRUE}
+for(i in 1: nrow(subs)){
+  if(subs$CALL_IN_COUNT[i] > call.count && subs$CALL_OUT_COUNT[i] == 0 && subs$RELATION_COUNT[i] > call.relation) {
+    subs$TYPE[i] <- "CALL CENTER"
+  } else if (subs$CALL_IN_COUNT[i] == 0 && subs$CALL_OUT_COUNT[i] > call.count && subs$CALL_OUT_COUNT[i] / subs$RELATION_COUNT[i] < call.mean) {
+    subs$TYPE[i] <- "TELESALES"
+  } else if (subs$CALL_IN_COUNT[i] == 1 && subs$CALL_OUT_COUNT[i] == 0 && subs$CALL_IN_DUR[i] < call.duration) {
+    subs$TYPE[i] <- "NOISY"
+  } else {
+    subs$TYPE[i] <- "NORMAL"
+  }
+}
+
+normal.msisdn <- subs[subs$TYPE == "NORMAL",]
+```
+
+Get the transaction records of normal MSISDN only and calculate average duration per call (Weight) betwen two MSISDNs.
+```{r eval=TRUE, echo=TRUE}
+filtered.transaction <- transaction[transaction$PARTY_A %in% normal.msisdn$MSISDN & transaction$PARTY_B %in% normal.msisdn$MSISDN,]
+filtered.transaction$Weight <- filtered.transaction$CALL_DURATION / filtered.transaction$CALL_COUNT
+head(filtered.transaction)
+```
+
+###(II) Transform Data Frame to Matrix
+```{r eval=TRUE, echo=TRUE}
+msisdn.list <- ExtractUniqueMSISDNList(filtered.transaction)
+ma <- matrix(0, ncol=nrow(msisdn.list), nrow=nrow(msisdn.list))
+madf <- data.frame(ma)
+
+colnames(madf) <- msisdn.list$MSISDN
+row.names(madf) <- msisdn.list$MSISDN
+
+filtered.transaction$PARTY_A <- as.character(filtered.transaction$PARTY_A)
+filtered.transaction$PARTY_B <- as.character(filtered.transaction$PARTY_B)
+
+for(i in 1:nrow(filtered.transaction)) {
+  madf[filtered.transaction[i,"PARTY_A"], filtered.transaction[i,"PARTY_B"]] <- filtered.transaction[i, "Weight"]
+}
+ma <- as.matrix(madf)
+ma[1:6, 1:6]
+```
+
+
+##(D) Social Network Analysis (SNA)
+###(I) Build the network
+```{r eval=TRUE, echo=TRUE, message=FALSE}
+net <- graph.adjacency(ma, mode="directed", weighted=TRUE, diag=FALSE)
+```
+
+###(II) Generate Result
+####(1) Closeness Centrality - how fast can a node reach everyone in the network.  
+```{r eval=TRUE, echo=TRUE, message=FALSE}
+res.closeness <- closeness(net)
+res <- setDT(data.frame(res.closeness), keep.rownames = TRUE)[]
+colnames(res)[1] <- "MSISDN"
+colnames(res)[2] <- "Closeness"
+res$MSISDN <- as.numeric(res$MSISDN)
+
+res.closeness[1:5]
+```
+## 
+####(2) Degree Centrality - the number of links connected to a node.
+```{r eval=TRUE, echo=TRUE}
+res <- cbind(res, degree(net))
+colnames(res)[ncol(res)] <- "Degree"
+
+degree(net)[1:5]
+```
+## 
+####(3) Betweenness Centrality - the extent to which a node lies on shortest paths between other nodes.  
+```{r eval=TRUE, echo=TRUE}
+res <- cbind(res, betweenness(net))
+colnames(res)[ncol(res)] <- "Betweenness"
+
+betweenness(net)[1:5]
+```
+## 
+####(4) Eigenvector Centrality - influence of a node in a network.
+```{r eval=TRUE, echo=TRUE}
+res <- cbind(res, eigen_centrality(net)$vector)
+colnames(res)[ncol(res)] <- "Eigenvector"
+
+eigen_centrality(net)$vector[1:5]
+```
+Result overview
+```{r eval=TRUE, echo=TRUE}
+head(res)
+```
+
+## 
+####(5) Density - total number of edges over total edges
+```{r eval=TRUE, echo=TRUE}
+density <- edge_density(net, loops=FALSE)
+density
+```
+## 
+####(6) Reciprocity - the ratio of edges which are dual-directed over total edges
+```{r eval=TRUE, echo=TRUE}
+reciprocity <- reciprocity(net)
+reciprocity
+```
+
+## Plots the network
+```{r eval=TRUE, echo=TRUE}
+V(net)$color=V(net)$name 
+V(net)$color=gsub("82457","red","orange")
+plot(net, edge.arrow.size=.4,vertex.label=NA)
+```
